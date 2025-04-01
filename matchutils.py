@@ -1,91 +1,96 @@
-import streamlit as st
+from rapidfuzz import fuzz
 import pandas as pd
-from match_utils import fuzzy_join
-from fpdf import FPDF
-import base64
-from io import BytesIO
+import numpy as np
+import re
+from tqdm.auto import tqdm
+tqdm.pandas()
 
-# ---------- SETUP ----------
-st.set_page_config(page_title="NYFFC Contractor Lookup Tool", layout="wide")
-st.title("🔍 NYFFC Contractor Search Tool")
-st.markdown("Search by contractor **name or ZIP code** to view related records across datasets.")
 
-# ---------- LOAD DATA ----------
-df_apprentice = pd.read_csv("cleaned_construction_apprentice.csv")
-df_wagetheft = pd.read_csv("cleaned_construction_wagetheft.csv")
+def norm_string(s):
+    """Remove punctuation and lowercase"""
+    return re.sub(r'[^a-zA-Z0-9\s]', '', str(s).lower().strip())
 
-# ---------- CLEANING / STANDARDIZATION ----------
-df_apprentice["signatory_name"] = df_apprentice["signatory_name"].str.lower().str.strip()
-df_wagetheft["company_name"] = df_wagetheft["company_name"].str.lower().str.strip()
 
-# ---------- SEARCH INTERFACE ----------
-query = st.text_input("🔎 Enter contractor name or ZIP code")
+class CompanyMap:
+    def __init__(self, df, name_cols, addr_col):
+        self.df = df.copy()
+        self.name_cols = name_cols
+        self.addr_col = addr_col
+        self.ref_name = "ref"
+        self.learned_data = self._prepare_data()
 
-if query:
-    query = query.lower().strip()
+    def _prepare_data(self):
+        df = self.df.copy()
+        for col in self.name_cols + [self.addr_col]:
+            df[col] = df[col].fillna("").apply(norm_string)
+        return df
 
-    # Filter df_apprentice for candidate records
-    filtered_apprentice = df_apprentice[
-        df_apprentice.apply(lambda row: query in str(row.values).lower(), axis=1)
-    ]
+    def get_match_idx(self, name_series, address, threshold=95, avg_threshold=80):
+        name_series = name_series.fillna("").apply(norm_string)
+        address = norm_string(address)
+        matches = []
 
-    # Run fuzzy join only if candidate records found
-    if not filtered_apprentice.empty:
-        st.write("🔄 Matching records using fuzzy name/address matching...")
-        matched_df = fuzzy_join(filtered_apprentice, df_wagetheft)
-    else:
-        matched_df = pd.DataFrame()
+        for i, row in self.learned_data.iterrows():
+            name_scores = [fuzz.partial_ratio(name_series[col], row[col]) for col in self.name_cols]
+            addr_score = fuzz.partial_ratio(address, row[self.addr_col])
+            max_name = max(name_scores)
+            avg_score = (max_name + addr_score) / 2
 
-    # ---------- RESULTS ----------
-    if not matched_df.empty:
-        st.subheader("🧾 Contractor Match Results")
+            if avg_score >= avg_threshold or max_name >= threshold or addr_score >= threshold:
+                matches.append(i)
 
-        for _, row in matched_df.iterrows():
-            with st.container():
-                st.markdown(f"""
-                <div style='border:2px solid #ccc;padding:15px;border-radius:10px;margin-bottom:15px;'>
-                    <h4>🏢 <b>{row.get('company_name', 'Unknown').title()}</b></h4>
-                    <p><b>Trade:</b> {row.get('trade', 'N/A')}</p>
-                    <p><b>Zip Code:</b> {row.get('zip_cd', 'N/A')}</p>
-                    <p><b>Wages Stolen:</b> ${row.get('wages_stolen', 0):,.2f}</p>
-                    <p><b>Match Confidence:</b> {row.get('avg_score', 0):.2f}%</p>
-                </div>
-                """, unsafe_allow_html=True)
+        return matches
 
-        st.download_button("📥 Download Matched Results (CSV)",
-                           data=matched_df.to_csv(index=False),
-                           file_name="nyffc_contractor_matches.csv",
-                           mime="text/csv")
 
-        # ---------- MATCH REPORT PDF ----------
-        def generate_pdf(df):
-            pdf = FPDF()
-            pdf.set_auto_page_break(auto=True, margin=15)
-            pdf.add_page()
-            pdf.set_font("Arial", size=12)
+class OneMapToRuleThemAll(CompanyMap):
+    def __init__(self, mappers, threshold=95, avg_threshold=80):
+        self.mappers = {m.ref_name: m for m in mappers}
+        self.threshold = threshold
+        self.avg_threshold = avg_threshold
 
-            pdf.cell(200, 10, txt="NYFFC Contractor Match Report", ln=True, align='C')
-            pdf.ln(10)
+        df, names, addr = self._concat_data()
+        super().__init__(df, names, addr)
+        self.learned_data['internal_match'] = self._internal_matches(self.learned_data)
 
-            for _, row in df.iterrows():
-                pdf.multi_cell(0, 10, txt=f"""
-Contractor: {row.get('company_name', 'N/A').title()}
-Trade: {row.get('trade', 'N/A')}
-Zip: {row.get('zip_cd', 'N/A')}
-Wages Stolen: ${row.get('wages_stolen', 0):,.2f}
-Match Confidence: {row.get('avg_score', 0):.2f}%
----
-                """)
+    def _concat_data(self):
+        frames = []
+        for k, m in self.mappers.items():
+            frame = m.learned_data[m.name_cols + [m.addr_col]].copy()
+            frame['keys'] = list(zip([k] * len(frame), m.learned_data.index))
+            frames.append(frame)
 
-            return pdf.output(dest='S').encode('latin1')
+        df = pd.concat(frames)
+        names = self.name_cols
+        addr = self.addr_col
+        df = df.groupby(names + [addr]).agg({'keys': list}).reset_index()
+        return df, names, addr
 
-        pdf_bytes = generate_pdf(matched_df)
-        b64 = base64.b64encode(pdf_bytes).decode()
-        href = f'<a href="data:application/octet-stream;base64,{b64}" download="nyffc_match_report.pdf">📄 Download Match Report (PDF)</a>'
-        st.markdown(href, unsafe_allow_html=True)
+    def _internal_matches(self, df):
+        return df.progress_apply(
+            lambda x: self.get_match_idx(
+                x[self.name_cols],
+                x[self.addr_col],
+                self.threshold,
+                self.avg_threshold
+            ), axis=1
+        )
 
-    else:
-        st.warning("No high-confidence matches found using fuzzy logic.")
+    def get_matches(self, names=[], address='', threshold=95, avg_threshold=80):
+        df = self.get_match_df(names, address, threshold, avg_threshold, fuzzy_alg=fuzz.partial_ratio)
+        matches = self.get_match_df(names, address, threshold, avg_threshold, fuzzy_alg=fuzz.partial_ratio)['internal_match']
+        results = {}
+        for map_id, idx in pd.DataFrame((self.learned_data.iloc[matches.values.sum()]['keys'].values).sum()).groupby(0):
+            results[map_id] = self.mappers[map_id].learned_data.iloc[idx[1].values]
+        return results
 
-st.markdown("---")
-st.caption("Built for NYFFC · v1.0")
+
+# Simple wrapper for basic fuzzy join use case
+def fuzzy_join(left_df, right_df, left_name_cols=['signatory_name'], right_name_cols=['company_name'],
+               left_addr_col='signatory_address', right_addr_col='zip_cd', how='inner', threshold=95, avg_threshold=80):
+
+    c = CompanyMap(right_df, right_name_cols, right_addr_col)
+    matches = left_df.progress_apply(
+        lambda x: c.get_match_idx(x[left_name_cols], x[left_addr_col], threshold, avg_threshold), axis=1)
+    df = pd.concat([left_df, pd.DataFrame(matches.tolist())], axis=1).melt(id_vars=left_df.columns)
+    df = df.set_index('value', drop=False).join(c.learned_data, lsuffix='_l', rsuffix='_r', how=how)
+    return df

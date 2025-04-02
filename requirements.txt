@@ -1,4 +1,8 @@
 streamlit
 pandas
+numpy
+tqdm
+fpdf
 rapidfuzz
 openpyxl
+
